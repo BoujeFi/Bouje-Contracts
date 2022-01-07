@@ -1141,7 +1141,7 @@ contract MasterChef is Ownable, ReentrancyGuard {
         //   pending reward = (user.amount * pool.accVivePerShare) - user.rewardDebt
         //
         // Whenever a user deposits or withdraws LP tokens to a pool. Here's what happens:
-        //   1. The pool's `accVivePerShare` (and `lastRewardBlock`) gets updated.
+        //   1. The pool's `accVivePerShare` (and `lastRewardTime`) gets updated.
         //   2. User receives the pending reward sent to his/her address.
         //   3. User's `amount` gets updated.
         //   4. User's `rewardDebt` gets updated.
@@ -1150,7 +1150,7 @@ contract MasterChef is Ownable, ReentrancyGuard {
     // Info of each pool.
     struct PoolInfo {
         IBEP20 lpToken; // Address of LP token contract.
-        uint256 allocPoint; // How many allocation points assigned to this pool. VIVE to distribute per block.
+        uint256 allocPoint; // How many allocation points assigned to this pool. VIVE to distribute per second.
         uint256 lastRewardTime; // Last time stamp that Vive distribution occurs.
         uint256 accVivePerShare; // Accumulated VIVE per share, times 1e18. See below.
         uint16 depositFeeBP; // Deposit fee in basis points
@@ -1159,7 +1159,7 @@ contract MasterChef is Ownable, ReentrancyGuard {
 
     // The VIVE TOKEN!
     VivelaboujeToken public immutable vivelaboujeToken;
-    address public devAddress;
+    address public devaddress;
     address public feeAddress;
 
     // VIVE tokens created per second.
@@ -1171,7 +1171,7 @@ contract MasterChef is Ownable, ReentrancyGuard {
     mapping(uint256 => mapping(address => UserInfo)) public userInfo;
     // Total allocation points. Must be the sum of all allocation points in all pools.
     uint256 public totalAllocPoint = 0;
-    // The block time when VIVE mining starts.
+    // The time when VIVE mining starts.
     uint256 public startTime;
 
     uint256 constant MAX_VIVE_SUPPLY = 888888 ether;
@@ -1185,16 +1185,17 @@ contract MasterChef is Ownable, ReentrancyGuard {
     event EmergencyWithdraw(address indexed user, uint256 indexed pid, uint256 amount);
     event SetFeeAddress(address indexed user, address indexed newAddress);
     event SetDevAddress(address indexed user, address indexed newAddress);
-    event SetVaultAddress(address indexed user, address indexed newAddress);
     event UpdateEmissionRate(address indexed user, uint256 vivePerSecond);
+    event UpdateStartTime(uint256 startTimestamp);
 
     constructor(
         VivelaboujeToken _vivelaboujeToken,
+        address _devaddress,
         uint256 _startTime
     ) public {
         vivelaboujeToken = _vivelaboujeToken;
         startTime = _startTime;
-        devAddress = msg.sender;
+        devaddress = _devaddress;
         feeAddress = msg.sender;
     }
 
@@ -1254,11 +1255,12 @@ contract MasterChef is Ownable, ReentrancyGuard {
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][_user];
         uint256 accVivePerShare = pool.accVivePerShare;
-        if (block.timestamp > pool.lastRewardTime && pool.lpSupply != 0) {
+        if (block.timestamp > pool.lastRewardTime && pool.lpSupply != 0 && totalAllocPoint > 0) {
             uint256 multiplier = getMultiplier(pool.lastRewardTime, block.timestamp);
             uint256 viveReward = multiplier.mul(vivePerSecond).mul(pool.allocPoint).div(totalAllocPoint);
+            uint256 devReward = viveReward.div(10);
             
-            uint256 totalRewards = vivelaboujeToken.totalSupply().add(viveReward);
+            uint256 totalRewards = vivelaboujeToken.totalSupply().add(devReward).add(viveReward);
             if (totalRewards > MAX_VIVE_SUPPLY) {
                 viveReward = MAX_VIVE_SUPPLY.sub(vivelaboujeToken.totalSupply());
             }
@@ -1287,18 +1289,29 @@ contract MasterChef is Ownable, ReentrancyGuard {
             return;
         }
 
-        uint256 currentSupply = vivelaboujeToken.totalSupply();
         uint256 multiplier = getMultiplier(pool.lastRewardTime, block.timestamp);
         uint256 viveReward = multiplier.mul(vivePerSecond).mul(pool.allocPoint).div(totalAllocPoint);
+        uint256 devReward = viveReward.div(10);
+        uint256 totalRewards = vivelaboujeToken.totalSupply().add(devReward).add(viveReward);
 
         // Accounts for Total Supply together with rewards
-        if(currentSupply.add(viveReward) <= MAX_VIVE_SUPPLY) {
+        if (totalRewards <= MAX_VIVE_SUPPLY) {
+            // mint as normal as not at maxSupply
+            vivelaboujeToken.mint(devaddress, viveReward.div(10));
             vivelaboujeToken.mint(address(this), viveReward);
-        } else if(currentSupply < MAX_VIVE_SUPPLY) {
-            vivelaboujeToken.mint(address(this), MAX_VIVE_SUPPLY.sub(currentSupply));
+        } else {
+            // mint the difference only to MC, update viveReward
+            viveReward = MAX_VIVE_SUPPLY.sub(vivelaboujeToken.totalSupply());
+            vivelaboujeToken.mint(address(this), viveReward);
         }
 
-        pool.accVivePerShare = pool.accVivePerShare.add(viveReward.mul(1e18).div(pool.lpSupply));
+        if (viveReward != 0) {
+            // only calculate and update if viveReward is non 0
+            pool.accVivePerShare = pool.accVivePerShare.add(
+                viveReward.mul(1e18).div(pool.lpSupply)
+            );
+        }
+
         pool.lastRewardTime = block.timestamp;
     }
 
@@ -1307,6 +1320,17 @@ contract MasterChef is Ownable, ReentrancyGuard {
         PoolInfo storage pool = poolInfo[_pid];
         UserInfo storage user = userInfo[_pid][msg.sender];
         updatePool(_pid);
+
+        if (user.amount > 0) {
+            uint256 pending = user
+                .amount
+                .mul(pool.accVivePerShare)
+                .div(1e18)
+                .sub(user.rewardDebt);
+            if (pending > 0) {
+                safeViveTransfer(msg.sender, pending);
+            }
+        }
 
         if (_amount > 0) {
             uint256 balanceBefore = pool.lpToken.balanceOf(address(this));
@@ -1317,6 +1341,7 @@ contract MasterChef is Ownable, ReentrancyGuard {
                 uint256 depositFee = _amount.mul(pool.depositFeeBP).div(10000);
                 pool.lpToken.safeTransfer(feeAddress, depositFee);
                 user.amount = user.amount.add(_amount).sub(depositFee);
+                pool.lpSupply = pool.lpSupply.add(_amount).sub(depositFee);
             } else {
                 pool.lpSupply = pool.lpSupply.add(_amount);
                 user.amount = user.amount.add(_amount);
@@ -1380,10 +1405,10 @@ contract MasterChef is Ownable, ReentrancyGuard {
     }
 
     // Update dev address by the previous dev.
-    function setDevAddress(address _devAddress) external onlyOwner {
-        require(_devAddress != address(0), "!nonzero");
-        devAddress = _devAddress;
-        emit SetDevAddress(msg.sender, _devAddress);
+    function setDevAddress(address _devaddress) external onlyOwner {
+        require(_devaddress != address(0), "!nonzero");
+        devaddress = _devaddress;
+        emit SetDevAddress(msg.sender, _devaddress);
     }
 
     function setFeeAddress(address _feeAddress) external onlyOwner {
@@ -1402,11 +1427,19 @@ contract MasterChef is Ownable, ReentrancyGuard {
     // Only update before start of farm
     function updateStartTime(uint256 _startTimestamp) external onlyOwner {
         require(startTime > block.timestamp, "Farm already started");
-        startTime = _startTimestamp;
+
+        require(
+            block.timestamp < _startTimestamp,
+            "cannot set start time in the past"
+        );
 
         for(uint256 i = 0; i < poolInfo.length; i++) {
             poolInfo[i].lastRewardTime = _startTimestamp;
         }
+        
+        startTime = _startTimestamp;
+
+        emit UpdateStartTime(startTime);
     }
 
     // Switches active pool
